@@ -46,7 +46,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         //用互斥锁解决缓存击穿
 
         Shop shop = queryWithMutex(id);
-        //7. 返回
+        if (shop == null) {
+            return Result.fail("店铺不存在！！");
+        }
+        //返回
         return Result.ok(shop);
     }
     public Shop queryWithMutex(Long id) {
@@ -58,41 +61,44 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             //3. 存在，直接返回
             return JSONUtil.toBean(shopJson, Shop.class);
         }
-
         //判断命中的是否是空值
         if (shopJson != null){
             //返回错误信息
             return null;
         }
 
-        //开始实现缓存重建
+        //4. 开始实现缓存重建
         //4.1 获取互斥锁
-        String lockkey = LOCK_SHOP_KEY + id;
-        boolean isLock = tryLock(lockkey);
-        //4.2 判断是否获取成功
-        if (!isLock){
-            //4.3 失败，则休眠并重试
-            try {
+        String lockKey = LOCK_SHOP_KEY + id;
+        Shop shop = null;
+        try {
+            boolean isLock = tryLock(lockKey);
+            //4.2 判断是否获取成功
+            if (!isLock){
+                //4.3 失败，则休眠并重试
                 Thread.sleep(50);
                 return queryWithMutex(id);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
-        //TODO 这里应该再次检查redis缓存是否存在，做DoubleCheck，如果存在则无语重建缓存
-        //4.4 成功，根据id查询数据库
 
-        //4. 不存在，根据id查询数据库
-        Shop shop = getById(id);
-        //5. 不存在，返回错误
-        if (shop == null){
-            //将空值写入redis
-            stringRedisTemplate.opsForValue().set(key, "",CACHE_NULL_TTL, TimeUnit.MINUTES);
-            return null;
+            }
+            //TODO 这里应该再次检查redis缓存是否存在，做DoubleCheck，如果存在则无需重建缓存
+
+            //4.4 成功，根据id查询数据库
+            shop = getById(id);
+            //5. 不存在，返回错误
+            if (shop == null){
+                //将空值写入redis
+                stringRedisTemplate.opsForValue().set(key, "",CACHE_NULL_TTL, TimeUnit.MINUTES);
+                return null;
+            }
+            //6. 存在，写入redis
+            stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            //7. 释放互斥锁
+            unlock(lockKey);
         }
-        //6. 存在，写入redis
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        //7. 返回
+        //8. 返回
         return shop;
     }
 
