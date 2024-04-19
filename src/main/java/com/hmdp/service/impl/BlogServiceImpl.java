@@ -1,6 +1,8 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.util.BooleanUtil;
+import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
@@ -16,7 +18,12 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static com.hmdp.utils.RedisConstants.BLOG_LIKED_KEY;
 
 /**
  * <p>
@@ -53,33 +60,38 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     private void isBlogLiked(Blog blog) {
         //1. 获取登录用户
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            //用户未登录，无需查询是否点赞
+            return;
+        }
         Long userId = UserHolder.getUser().getId();
         //2. 判断当前用户是否已经点赞
-        String key = "blog:liked:" + blog;
-        Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
-        blog.setIsLike(BooleanUtil.isTrue(isMember));
+        String key = BLOG_LIKED_KEY + blog;
+        Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+        blog.setIsLike(score != null);
     }
 
     /**
-     * 点赞博客
+     * 对博客进行点赞或取消点赞的操作。
      *
-     * @param id 博客的唯一标识符
-     * @return 返回操作结果，如果操作成功，则返回一个表示成功的Result对象
+     * @param id 博客的ID，用于标识需要点赞或取消点赞的博客。
+     * @return 返回操作结果，如果操作成功，则返回成功结果。
      */
     @Override
     public Result likeBlog(Long id) {
         //1. 获取登录用户
         Long userId = UserHolder.getUser().getId();
         //2. 判断当前用户是否已经点赞
-        String key = "blog:liked:" + id;
-        Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
-        if (BooleanUtil.isFalse(isMember)) {
+        String key = BLOG_LIKED_KEY + id;
+        Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+        if (score == null) {
             //3. 如果未点赞，可以点赞
-            //3.1 数据库点赞 + 1
+            //3.1 数据库点赞 + 1 zadd key value score
             boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
             //3.2 保存到Redis中的set集合 点赞数+1
             if (isSuccess) {
-                stringRedisTemplate.opsForSet().add(key, userId.toString());
+                stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());//加入时间戳
             }
         } else {
             //4. 如果已点赞，取消点赞
@@ -87,7 +99,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
             boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
             //4.2 把用户从Redis中的set集合移除
             if (isSuccess) {
-                stringRedisTemplate.opsForSet().remove(key, userId.toString());
+                stringRedisTemplate.opsForZSet().remove(key, userId.toString());
             }
         }
         return Result.ok();
@@ -108,6 +120,28 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
             this.isBlogLiked(blog);
         });
         return Result.ok(records);
+    }
+
+    @Override
+    public Result queryBlogLikes(Long id) {
+        //1. 查询top5的点赞用户 zrange key 0 4
+        String key = BLOG_LIKED_KEY + id;
+        Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+        if (top5 == null || top5.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        //2. 解析出其中的用户id
+        List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+        String idStr = StrUtil.join(",", ids);
+        //3. 根据用户id查询用户
+        List<UserDTO> userDTOS = userService.query()
+                .in("id", ids)
+                .last("ORDER BY FIELD(id," + idStr + ")").list()
+                .stream()
+                .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+                .collect(Collectors.toList());
+        //4. 返回
+        return Result.ok(userDTOS);
     }
 
     private void queryBlogUser(Blog blog) {
